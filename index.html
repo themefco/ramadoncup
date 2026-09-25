@@ -172,7 +172,7 @@ function eventTeam(e){return teamById(e?.team_id)?.name||e?.team||""}
 function showToast(msg){const t=document.getElementById("toast");if(!t)return;t.textContent=msg;t.classList.add("show");clearTimeout(showToast.t);showToast.t=setTimeout(()=>t.classList.remove("show"),2600)}
 
 async function supabaseFetch(url,options={}){
- const r=await fetch(url,{...options,headers:{
+ const r=await fetch(url,{cache:options.cache||"no-store",...options,headers:{
   apikey:SUPABASE_KEY,
   Authorization:"Bearer "+SUPABASE_KEY,
   "Content-Type":"application/json",
@@ -296,6 +296,8 @@ async function loadData(){
  competitions.sort((a,b)=>competitionName(a).localeCompare(competitionName(b)));
  news.sort((a,b)=>new Date(b.created_at||b.published_at||0)-new Date(a.created_at||a.published_at||0));
  eventsLoadedAll=false;for(const m of matches){const ev=eventCache.get(String(m.id));if(ev)m.events=ev.slice();}
+ /* Refresh the currently selected match's events from Supabase instead of trusting an old cache. */
+ if(selectedMatchId){try{await loadMatchEvents(selectedMatchId,true)}catch(e){console.warn("CupWorks selected match event refresh failed",e)}}
  dbOnline=jobs[0].status==="fulfilled"&&jobs[2].status==="fulfilled";
 
  /* Never destroy an active lineup draft during refresh. */
@@ -779,14 +781,17 @@ function resumeLiveTimer(){const live=matches.find(m=>String(m.id)===String(sele
 
 /* ---------- EVENTS ---------- */
 async function postEvent(event){
+ /* Supabase uses UUIDs for match/team/player IDs. Never coerce them to Number. */
  const payload={...event,data:event.data&&typeof event.data==="object"?event.data:{}};
- if(payload.match_id!=null)payload.match_id=Number(payload.match_id);
- if(payload.team_id!=null)payload.team_id=Number(payload.team_id);
- if(payload.player_id!=null)payload.player_id=Number(payload.player_id);
- if(payload.player_out_id!=null)payload.player_out_id=Number(payload.player_out_id);
- if(!Number.isInteger(payload.match_id))throw new Error("Invalid match_id for event");
- if(payload.team_id!=null&&!Number.isInteger(payload.team_id))throw new Error("Invalid team_id for event");
- if(payload.player_id!=null&&!Number.isInteger(payload.player_id))throw new Error("Invalid player_id for event");
+ const cleanId=v=>v==null?null:String(v).trim();
+ payload.match_id=cleanId(payload.match_id);
+ payload.team_id=cleanId(payload.team_id);
+ payload.player_id=cleanId(payload.player_id);
+ payload.player_out_id=cleanId(payload.player_out_id);
+ if(!payload.match_id)throw new Error("Invalid match_id for event");
+ if(payload.team_id==="")payload.team_id=null;
+ if(payload.player_id==="")payload.player_id=null;
+ if(payload.player_out_id==="")payload.player_out_id=null;
  const result=await supabaseFetch(EVENTS_URL,{method:"POST",body:JSON.stringify(payload)});
  const row=Array.isArray(result)?result[0]:result;
  if(!row||row.id==null)throw new Error("Event INSERT returned no row. Check matches-events INSERT/SELECT policies.");
@@ -813,17 +818,15 @@ async function addGoalWithAssist(){
  if(!m)return;
  if(addGoalWithAssist.busy){showToast("A goal is already being saved");return}
  addGoalWithAssist.busy=true;
- const teamIdRaw=document.getElementById("eventTeamSelect")?.value;
- const playerIdRaw=document.getElementById("eventPlayerSelect")?.value||null;
- const assistIdRaw=document.getElementById("eventAssistPlayerSelect")?.value||null;
+ const teamId=String(document.getElementById("eventTeamSelect")?.value||"").trim();
+ const playerId=String(document.getElementById("eventPlayerSelect")?.value||"").trim();
+ const assistId=String(document.getElementById("eventAssistPlayerSelect")?.value||"").trim()||null;
  const minute=Math.max(0,Number(document.getElementById("eventMinute")?.value)||Number(m.minute)||0);
  const stoppage=Math.max(0,Number(document.getElementById("eventStoppage")?.value)||0);
- const teamId=Number(teamIdRaw),playerId=Number(playerIdRaw),assistId=assistIdRaw?Number(assistIdRaw):null,matchId=Number(m.id);
- if(!Number.isInteger(teamId)||!Number.isInteger(playerId)||!Number.isInteger(matchId)){showToast("Invalid match, team or player ID");addGoalWithAssist.busy=false;return}
- if(assistId!=null&&!Number.isInteger(assistId)){showToast("Invalid assist player ID");addGoalWithAssist.busy=false;return}
- if(!teamId||!playerId){showToast("Select the scoring team and scorer");addGoalWithAssist.busy=false;return}
+ const matchId=String(m.id||"").trim();
+ if(!teamId||!playerId||!matchId){showToast("Select the scoring team and scorer");addGoalWithAssist.busy=false;return}
  if(assistId&&assistId===playerId){showToast("Scorer and assister must be different");addGoalWithAssist.busy=false;return}
- const isHome=teamId===Number(m.home_team_id),isAway=teamId===Number(m.away_team_id);
+ const isHome=teamId===String(m.home_team_id||""),isAway=teamId===String(m.away_team_id||"");
  if(!isHome&&!isAway){showToast("Scoring team is not part of this match");addGoalWithAssist.busy=false;return}
  const p=playerById(playerId),ap=playerById(assistId);
  if(!p){showToast(`Player ${playerId} is not loaded in CupWorks`);addGoalWithAssist.busy=false;return}
@@ -861,6 +864,14 @@ async function addGoalWithAssist(){
   /* Local state is updated only after every database step succeeds. */
   m.events=m.events||[];
   created.forEach(e=>m.events.push(e));
+  /* Re-read the authoritative match/event rows so the UI never renders a stale cache after a goal. */
+  try{
+   await loadMatchEvents(m.id,true);
+   const fresh=await safeLoad(MATCHES_URL+"?id=eq."+encodeURIComponent(m.id)+"&select=*");
+   const authoritative=Array.isArray(fresh)?fresh[0]:fresh;
+   if(authoritative)Object.assign(m,authoritative);
+   const ev=eventCache.get(String(m.id));if(ev)m.events=ev.slice();
+  }catch(e){console.warn("CupWorks post-goal authoritative refresh failed",e)}
   try{renderAll()}catch(uiError){console.error("CupWorks goal render failed:",uiError)}
   showToast(assistId?"Goal + assist saved":"Goal saved");
  }catch(e){
@@ -1001,8 +1012,11 @@ async function refreshData(){showToast("Refreshing CupWorks data…");try{await 
 function startAutoRefresh(){
  if(window.cupworksRefreshTimer)clearInterval(window.cupworksRefreshTimer);
  window.cupworksRefreshTimer=setInterval(()=>{
-  if(document.visibilityState==="visible")loadData().catch(()=>{});
- },20000);
+  if(document.visibilityState==="visible"&&!window.cupworksRefreshBusy){
+   window.cupworksRefreshBusy=true;
+   loadData().catch(()=>{}).finally(()=>{window.cupworksRefreshBusy=false});
+  }
+ },30000);
 }
 function setupRealtime(){
  if(!window.supabase?.createClient||realtimeChannels.length)return;

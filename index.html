@@ -713,6 +713,7 @@ async function startSelected(){
  const clockOk=await setLiveClockState(m,"start");
  if(!clockOk){await persistStatus(id,String(m.status||"scheduled"));showToast("Match started, but the clock could not be initialized");return}
  m.status="live";startTimer();renderMatch();renderAdminPanel();showToast("Match is LIVE");
+ cupworksPushMatchNotification(m,{title:"🏁 CupWorks Match Started",body:`${teamDisplayName(m,"home")} vs ${teamDisplayName(m,"away")} has started.`});
 }
 
 async function pauseSelected(){
@@ -726,6 +727,7 @@ async function pauseSelected(){
  await updateMatch(m.id,{minute:current,metadata:meta});
  m.minute=current;m.metadata=meta;m.status="halftime";
  renderMatch();renderAdminPanel();showToast(`Half time • ${current}'`);
+ cupworksPushMatchNotification(m,{title:"⏸️ CupWorks Half Time",body:`${teamDisplayName(m,"home")} ${scoreOf(m)[0]}–${scoreOf(m)[1]} ${teamDisplayName(m,"away")} • Half time`});
 }
 
 async function syncPlayerTotalsFromEvents(){
@@ -771,7 +773,7 @@ async function syncCompletedMatchStats(match){
   return false;
  }
 }
-async function finishSelected(){const m=matches.find(x=>String(x.id)===String(selectedMatchId));if(!m)return;const he=document.getElementById('admHomeScore'),ae=document.getElementById('admAwayScore'),me=document.getElementById('admMinute'),se=document.getElementById('admStoppage');const homeScore=he?Math.max(0,Math.floor(Number(he.value)||0)):Math.max(0,Math.floor(Number(m.score_home)||0)),awayScore=ae?Math.max(0,Math.floor(Number(ae.value)||0)):Math.max(0,Math.floor(Number(m.score_away)||0)),minute=me?Math.max(0,Math.floor(Number(me.value)||0)):Math.max(0,Math.floor(isLive(m)?liveMinute(m):Number(m.minute)||0)),stoppage=se?Math.max(0,Math.floor(Number(se.value)||0)):Math.max(0,Math.floor(Number(m.stoppage)||0));showToast('Saving final score…');if(!await updateMatch(m.id,{score_home:homeScore,score_away:awayScore,minute,stoppage})){showToast('Match was not finished because the final score could not be saved.');return}if(!await persistStatus(m.id,'finished'))return;stopTimer();m.score_home=homeScore;m.score_away=awayScore;m.minute=minute;m.stoppage=stoppage;m.status='finished';delete readMatchMetadata(m).clock;showToast('Match finished — syncing events and stats…');await syncCompletedMatchStats(m);await loadData();const fresh=matches.find(x=>String(x.id)===String(m.id));if(fresh&&isFinished(fresh))showToast(`Final saved: ${scoreOf(fresh)[0]}–${scoreOf(fresh)[1]} • FULL TIME`);else if(fresh)showToast('Score saved, but status verification failed — check Supabase.');}
+async function finishSelected(){const m=matches.find(x=>String(x.id)===String(selectedMatchId));if(!m)return;const he=document.getElementById('admHomeScore'),ae=document.getElementById('admAwayScore'),me=document.getElementById('admMinute'),se=document.getElementById('admStoppage');const homeScore=he?Math.max(0,Math.floor(Number(he.value)||0)):Math.max(0,Math.floor(Number(m.score_home)||0)),awayScore=ae?Math.max(0,Math.floor(Number(ae.value)||0)):Math.max(0,Math.floor(Number(m.score_away)||0)),minute=me?Math.max(0,Math.floor(Number(me.value)||0)):Math.max(0,Math.floor(isLive(m)?liveMinute(m):Number(m.minute)||0)),stoppage=se?Math.max(0,Math.floor(Number(se.value)||0)):Math.max(0,Math.floor(Number(m.stoppage)||0));showToast('Saving final score…');if(!await updateMatch(m.id,{score_home:homeScore,score_away:awayScore,minute,stoppage})){showToast('Match was not finished because the final score could not be saved.');return}if(!await persistStatus(m.id,'finished'))return;stopTimer();m.score_home=homeScore;m.score_away=awayScore;m.minute=minute;m.stoppage=stoppage;m.status='finished';delete readMatchMetadata(m).clock;showToast('Match finished — syncing events and stats…');cupworksPushMatchNotification(m,{title:"🏁 CupWorks Full Time",body:`${teamDisplayName(m,"home")} ${scoreOf(m)[0]}–${scoreOf(m)[1]} ${teamDisplayName(m,"away")} • Full time`});await syncCompletedMatchStats(m);await loadData();const fresh=matches.find(x=>String(x.id)===String(m.id));if(fresh&&isFinished(fresh))showToast(`Final saved: ${scoreOf(fresh)[0]}–${scoreOf(fresh)[1]} • FULL TIME`);else if(fresh)showToast('Score saved, but status verification failed — check Supabase.');}
 
 
 /* ---------- CLOCK: NEVER REBUILD DIRTY LINEUP EDITOR ---------- */
@@ -783,9 +785,11 @@ function startTimer(){
   const minute=Math.max(0,Math.floor(liveMinute(m)));
   const previous=Number(m.minute||0);
   if(minute!==previous){
-   m.minute=minute;
+   const meta=readMatchMetadata(m);
+   meta.clock={started_at:new Date().toISOString(),base_minute:minute,base_stoppage:Number(m.stoppage||0)};
+   m.minute=minute;m.metadata=meta;
    try{
-    await supabaseFetch(MATCHES_URL+"?id=eq."+encodeURIComponent(m.id),{method:"PATCH",body:JSON.stringify({minute,status:"live"}),headers:{Prefer:"return=minimal"}});
+    await supabaseFetch(MATCHES_URL+"?id=eq."+encodeURIComponent(m.id),{method:"PATCH",body:JSON.stringify({minute,status:"live",metadata:meta}),headers:{Prefer:"return=minimal"}});
    }catch(e){console.warn("CupWorks clock persistence failed:",e)}
   }
   const min=document.getElementById("admMinute");if(min&&!document.activeElement?.matches?.("#admMinute"))min.value=minute;
@@ -814,6 +818,10 @@ async function postEvent(event){
  const result=await supabaseFetch(EVENTS_URL,{method:"POST",body:JSON.stringify(payload)});
  const row=Array.isArray(result)?result[0]:result;
  if(!row||row.id==null)throw new Error("Event INSERT returned no row. Check matches-events INSERT/SELECT policies.");
+ try{
+  const match=matches.find(x=>String(x.id)===String(row.match_id));
+  if(match)cupworksPushMatchNotification(match,{event:row});
+ }catch(e){console.warn("CupWorks event notification failed:",e)}
  return row;
 }
 async function deleteEventRow(id){
@@ -1072,12 +1080,7 @@ function setupRealtime(){
    }
    const newScore=Number(m.score_home||0)+"-"+Number(m.score_away||0);
    const scoreChanged=oldScore!==newScore,statusChanged=String(m.status||"")!==String(incoming.status||"");
-   if(fav&&typeof Notification!=="undefined"&&Notification.permission==="granted"&&scoreChanged){
-    cupworksNotifyOnce("score",`${m.id}:${newScore}`,"CupWorks Score Update",`${teamDisplayName(m,"home")} ${newScore.replace("-","–")} ${teamDisplayName(m,"away")}`)
-   }
-   if(fav&&typeof Notification!=="undefined"&&Notification.permission==="granted"&&statusChanged&&isFinished(m)){
-    cupworksNotifyOnce("fulltime",m.id,"CupWorks Full Time",`${teamDisplayName(m,"home")} ${newScore.replace("-","–")} ${teamDisplayName(m,"away")}`)
-   }
+   /* Server push is authoritative; realtime only updates the UI. */
    try{renderAll()}catch(err){console.error("CupWorks realtime match render:",err)}
   }).subscribe();
   realtimeChannels=[eventsChannel,matchesChannel];
@@ -1111,30 +1114,7 @@ async function enableNotifications(){
   showToast(p==="granted"?"Notifications enabled":p==="denied"?"Notifications are blocked in browser settings":"Notification permission not granted");
  }catch(e){console.error(e);showToast("Could not enable notifications")}
 }
-function notifyFavoriteChanges(previousMatches){
- if(!("Notification"in window)||Notification.permission!=="granted")return;
- const previousById=new Map((previousMatches||[]).map(m=>[String(m.id),m]));
- const seenKey="ramadoncup_notified_events";let seen={};let hadState=false;try{seen=JSON.parse(localStorage.getItem(seenKey)||"{}");hadState=Object.keys(seen).length>0}catch{}
- const fav=new Set(favoriteIds());
- if(!hadState){for(const m of matches)for(const e of (m.events||[]))if(e?.id)seen[e.id]=1;try{localStorage.setItem(seenKey,JSON.stringify(seen))}catch{}return;}
- for(const m of matches){
-  if(!fav.has(String(m.id)))continue;
-  const old=previousById.get(String(m.id));
-  for(const e of (m.events||[])){
-   if(!e?.id||seen[e.id])continue;
-   seen[e.id]=1;
-   const t=eventType(e);
-   if(["goal","yellow","red"].includes(t)){
-    const title=t==="goal"?"⚽ CupWorks Goal":t==="yellow"?"🟨 CupWorks Yellow Card":"🟥 CupWorks Red Card";
-    const body=`${teamDisplayName(m,"home")} ${scoreOf(m)[0]}–${scoreOf(m)[1]} ${teamDisplayName(m,"away")} • ${eventPlayer(e)||eventTeam(e)||"Match event"}`;
-    try{new Notification(title,{body,tag:`mefco-${m.id}-${e.id}`})}catch{}
-   }
-  }
-  const wasFinished=old&&isFinished(old),nowFinished=isFinished(m);
-  if(nowFinished&&!wasFinished){try{new Notification("CupWorks Full Time",{body:`${teamDisplayName(m,"home")} ${scoreOf(m)[0]}–${scoreOf(m)[1]} ${teamDisplayName(m,"away")}`,tag:`mefco-ft-${m.id}`})}catch{}}
- }
- try{localStorage.setItem(seenKey,JSON.stringify(seen))}catch{}
-}
+function notifyFavoriteChanges(){}
 async function sendNotification(title,body,url="/"){try{const r=await fetch(NOTIFICATION_API+"/api/notify",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({title,body,url})});if(!r.ok)throw new Error(await r.text());showToast("Notification sent")}catch(e){showToast("Notification service unavailable")}}
 function addLog(msg){adminLog.unshift({time:new Date().toLocaleTimeString(),msg});if(adminLog.length>50)adminLog.pop()}
 
@@ -2167,6 +2147,32 @@ function migrateCupWorksFollows(){
 
 migrateCupWorksFollows();
 
+async function cupworksPushMatchNotification(match,info={}){
+ try{
+  const sub=await ensureCupWorksPushSubscription(false);
+  if(!sub||!match)return false;
+  const targets=[{follow_type:"match",target_id:String(match.id)}];
+  if(match.home_team_id)targets.push({follow_type:"team",target_id:String(match.home_team_id)});
+  if(match.away_team_id)targets.push({follow_type:"team",target_id:String(match.away_team_id)});
+  const e=info.event;if(e?.player_id)targets.push({follow_type:"player",target_id:String(e.player_id)});
+  let title=String(info.title||"CupWorks Match Update");
+  let body=String(info.body||`${teamDisplayName(match,"home")} ${scoreOf(match)[0]}–${scoreOf(match)[1]} ${teamDisplayName(match,"away")}`);
+  let tag=`cupworks-match-${String(match.id)}`;
+  if(e){
+   const t=eventType(e);
+   const labels={goal:"⚽ CupWorks Goal",assist:"🅰️ CupWorks Assist",yellow:"🟨 CupWorks Yellow Card",red:"🟥 CupWorks Red Card",other:"📣 CupWorks Match Event"};
+   title=labels[t]||`📣 CupWorks ${t||"Match Event"}`;
+   const who=eventPlayer(e)||eventTeam(e)||"Match event";
+   const minute=Number(e.minute||0)>0?` • ${Number(e.minute)}'${Number(e.stoppage||0)>0?`+${Number(e.stoppage)}`:""}`:"";
+   body=`${teamDisplayName(match,"home")} ${scoreOf(match)[0]}–${scoreOf(match)[1]} ${teamDisplayName(match,"away")} • ${who}${minute}${e.detail?` • ${e.detail}`:""}`;
+   tag=`cupworks-event-${String(e.id)}`;
+  }
+  const response=await fetch(NOTIFICATION_API+"/api/notify",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({title,body,url:location.href,tag,renotify:true,targets})});
+  if(!response.ok){console.warn("CupWorks push rejected:",await response.text());return false}
+  return true;
+ }catch(error){console.warn("CupWorks server push unavailable:",error);return false}
+}
+
 /* Existing in-page fallback for events while the real server push subscription is active. */
 function cupworksNotifyOnce(kind,id,title,body){
   if(typeof Notification==='undefined'||Notification.permission!=='granted'||id==null)return false;
@@ -2283,6 +2289,8 @@ renderMatch=function(){
 };
 
 window.addEventListener('load',syncNotificationButton);
+notifyFavoriteEvent=function(){};
+notifyFavoriteChanges=function(){};
 </script>
 
 </body>
